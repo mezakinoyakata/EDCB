@@ -96,6 +96,24 @@ CREATE TABLE IF NOT EXISTS event_groups (
     ref_event_id INTEGER NOT NULL,
     PRIMARY KEY (onid, tsid, sid, event_id, group_type, seq)
 );
+CREATE INDEX IF NOT EXISTS idx_events_start   ON events(start_time);
+CREATE INDEX IF NOT EXISTS idx_events_service ON events(onid, tsid, sid);
+)sql";
+
+const char* DDL_FTS_AND_VIEWS = R"sql(
+CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+    event_name, short_text, ext_text,
+    content=events, content_rowid=rowid,
+    tokenize='trigram'
+);
+DROP VIEW IF EXISTS upcoming;
+DROP VIEW IF EXISTS program_guide;
+CREATE VIEW program_guide AS
+    SELECT e.rowid, e.*, s.service_name, s.network_name, s.remote_control_key
+    FROM events e JOIN services s USING (onid, tsid, sid);
+CREATE VIEW upcoming AS
+    SELECT * FROM program_guide
+    WHERE start_time > datetime('now', '+9 hours');
 )sql";
 
 struct Stmt {
@@ -138,6 +156,7 @@ void ExportEpgToSqlite(const wchar_t* dbPath, const std::map<LONGLONG, EPGDB_SER
     exec_sql(db, "PRAGMA journal_mode=WAL;");
     exec_sql(db, "PRAGMA synchronous=NORMAL;");
     exec_sql(db, DDL_CREATE_TABLES);
+    exec_sql(db, DDL_FTS_AND_VIEWS);
     exec_sql(db, "BEGIN;");
 
     Stmt svcStmt, evtStmt, gnrStmt, audStmt, grpStmt;
@@ -281,6 +300,7 @@ void ExportEpgToSqlite(const wchar_t* dbPath, const std::map<LONGLONG, EPGDB_SER
         }
     }
 
+    exec_sql(db, "INSERT INTO events_fts(events_fts) VALUES('rebuild');");
     exec_sql(db, "COMMIT;");
     sqlite3_close(db);
 
