@@ -9,6 +9,7 @@
 #include "../../Common/EpgDataCap3Util.h"
 #include "../../Common/CtrlCmdUtil.h"
 #include "../../Common/TSPacketUtil.h"
+#include "EpgSqliteExporter.h"
 #include <list>
 
 CEpgDBManager::CEpgDBManager()
@@ -158,6 +159,8 @@ void CEpgDBManager::LoadThread(CEpgDBManager* sys)
 		}
 		return true;
 	});
+
+	AddDebugLogFormat(L"EpgData: %d files", (int)epgFileList.size());
 
 	DWORD loadElapsed = 0;
 	DWORD loadTick = GetTickCount();
@@ -332,6 +335,18 @@ void CEpgDBManager::LoadThread(CEpgDBManager* sys)
 		epgUtil.EnumEpgInfoList(item.serviceInfo.ONID, item.serviceInfo.TSID, item.serviceInfo.SID, EnumEpgInfoListProc, &item);
 	}
 	epgUtil.UnInitialize();
+
+	{
+		int totalEvt = 0;
+		for( const auto& kv : nextMap ) totalEvt += (int)kv.second.eventList.size();
+		AddDebugLogFormat(L"EpgData: parsed svc=%d evt=%d", (int)nextMap.size(), totalEvt);
+	}
+
+	// EPGデータをSQLiteに書き出す
+	if( sys->loadStop == false ){
+		fs_path dbPath = fs_path(settingPath).append(L"EpgData.db");
+		ExportEpgToSqlite(dbPath.c_str(), nextMap);
+	}
 
 	__int64 arcMax = GetNowI64Time() / I64_1SEC * I64_1SEC;
 	__int64 arcMin = LLONG_MAX;

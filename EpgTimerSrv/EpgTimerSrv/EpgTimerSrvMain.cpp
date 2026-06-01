@@ -1836,6 +1836,9 @@ void CEpgTimerSrvMain::CtrlCmdCallback(CEpgTimerSrvMain* sys, const CCmdStream& 
 				vector<const EPGDB_SERVICE_EVENT_INFO*> valp;
 				valp.reserve(val.size());
 				for( auto itr = val.cbegin(); itr != val.end(); valp.push_back(&(itr++)->second) );
+				int evtTotal = 0;
+				for( const auto* p : valp ) evtTotal += (int)p->eventList.size();
+				AddDebugLogFormat(L"EnumPgAll svc=%d evt=%d", (int)valp.size(), evtTotal);
 				res.SetParam(CMD_SUCCESS);
 				res.WriteVALUE(valp);
 			});
