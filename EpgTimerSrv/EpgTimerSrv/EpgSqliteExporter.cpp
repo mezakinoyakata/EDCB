@@ -1,10 +1,10 @@
 #include "stdafx.h"
 #include "EpgSqliteExporter.h"
 #include "../../Common/StringUtil.h"
-#include "sqlite3.h"
+#include <mysql.h>
+#include <fstream>
 
-namespace
-{
+namespace {
 
 inline std::string W2U8(const wstring& w)
 {
@@ -21,164 +21,184 @@ std::string SystemTimeToStr(const SYSTEMTIME& st)
     return buf;
 }
 
-const char* DDL_CREATE_TABLES = R"sql(
+// MySQL 接続設定（EpgMysqlConn.ini から読み込む）
+struct ConnInfo {
+    std::string host     = "localhost";
+    int         port     = 3306;
+    std::string database = "edcbviewer";
+    std::string user;
+    std::string password;
+};
+
+bool LoadConnInfo(const wchar_t* iniPath, ConnInfo& out)
+{
+    std::string pathU8;
+    WtoUTF8(wstring(iniPath), pathU8);
+    std::ifstream f(pathU8);
+    if (!f) return false;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if      (key == "host")     out.host     = val;
+        else if (key == "port")     out.port     = std::stoi(val);
+        else if (key == "database") out.database = val;
+        else if (key == "user")     out.user     = val;
+        else if (key == "password") out.password = val;
+    }
+    return !out.user.empty();
+}
+
+// 文字列を MySQL のエスケープ付きシングルクォートで囲む
+std::string Q(MYSQL* db, const std::string& s)
+{
+    std::string buf(s.size() * 2 + 1, '\0');
+    unsigned long len = mysql_real_escape_string(db, &buf[0], s.c_str(), (unsigned long)s.size());
+    buf.resize(len);
+    return "'" + buf + "'";
+}
+
+// NULL または整数値
+std::string N(bool hasValue, int val)
+{
+    return hasValue ? std::to_string(val) : "NULL";
+}
+
+// NULL または文字列
+std::string NQ(MYSQL* db, bool hasValue, const std::string& val)
+{
+    return hasValue ? Q(db, val) : "NULL";
+}
+
+void Exec(MYSQL* db, const std::string& sql)
+{
+    if (mysql_query(db, sql.c_str()) != 0)
+        AddDebugLogFormat(L"EpgMysql query error: %S\n%S", mysql_error(db), sql.substr(0, 120).c_str());
+}
+
+// CREATE TABLE が存在しない場合のみ作成。
+// インデックスは TABLE 定義内の KEY 句として作成するため IF NOT EXISTS 不要。
+static const char* DDL_SERVICES = R"sql(
 CREATE TABLE IF NOT EXISTS services (
-    onid               INTEGER NOT NULL,
-    tsid               INTEGER NOT NULL,
-    sid                INTEGER NOT NULL,
-    service_type       INTEGER NOT NULL DEFAULT 0,
-    partial_reception  INTEGER NOT NULL DEFAULT 0,
+    onid               INT NOT NULL,
+    tsid               INT NOT NULL,
+    sid                INT NOT NULL,
+    service_type       INT NOT NULL DEFAULT 0,
+    partial_reception  INT NOT NULL DEFAULT 0,
     provider_name      TEXT NOT NULL DEFAULT '',
     service_name       TEXT NOT NULL DEFAULT '',
     network_name       TEXT NOT NULL DEFAULT '',
     ts_name            TEXT NOT NULL DEFAULT '',
-    remote_control_key INTEGER NOT NULL DEFAULT 0,
-    updated_at         TEXT NOT NULL DEFAULT '',
+    remote_control_key INT NOT NULL DEFAULT 0,
+    updated_at         VARCHAR(30) NOT NULL DEFAULT '',
     PRIMARY KEY (onid, tsid, sid)
-);
+) ENGINE=InnoDB CHARACTER SET utf8mb4
+)sql";
+
+static const char* DDL_EVENTS = R"sql(
 CREATE TABLE IF NOT EXISTS events (
-    onid                     INTEGER NOT NULL,
-    tsid                     INTEGER NOT NULL,
-    sid                      INTEGER NOT NULL,
-    event_id                 INTEGER NOT NULL,
-    start_time               TEXT,
-    duration_sec             INTEGER,
+    onid                     INT NOT NULL,
+    tsid                     INT NOT NULL,
+    sid                      INT NOT NULL,
+    event_id                 INT NOT NULL,
+    start_time               VARCHAR(30),
+    duration_sec             INT,
     event_name               TEXT NOT NULL DEFAULT '',
     short_text               TEXT NOT NULL DEFAULT '',
-    ext_text                 TEXT NOT NULL DEFAULT '',
-    component_stream_content INTEGER,
-    component_type           INTEGER,
-    component_tag            INTEGER,
+    ext_text                 MEDIUMTEXT NOT NULL DEFAULT '',
+    component_stream_content INT,
+    component_type           INT,
+    component_tag            INT,
     component_text           TEXT NOT NULL DEFAULT '',
-    free_ca_flag             INTEGER NOT NULL DEFAULT 0,
-    updated_at               TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (onid, tsid, sid, event_id)
-);
+    free_ca_flag             INT NOT NULL DEFAULT 0,
+    updated_at               VARCHAR(30) NOT NULL DEFAULT '',
+    PRIMARY KEY (onid, tsid, sid, event_id),
+    KEY idx_start   (start_time),
+    KEY idx_service (onid, tsid, sid)
+) ENGINE=InnoDB CHARACTER SET utf8mb4
+)sql";
+
+static const char* DDL_GENRES = R"sql(
 CREATE TABLE IF NOT EXISTS event_genres (
-    onid          INTEGER NOT NULL,
-    tsid          INTEGER NOT NULL,
-    sid           INTEGER NOT NULL,
-    event_id      INTEGER NOT NULL,
-    seq           INTEGER NOT NULL,
-    nibble_l1     INTEGER NOT NULL,
-    nibble_l2     INTEGER NOT NULL,
-    user_nibble_1 INTEGER NOT NULL,
-    user_nibble_2 INTEGER NOT NULL,
+    onid          INT NOT NULL,
+    tsid          INT NOT NULL,
+    sid           INT NOT NULL,
+    event_id      INT NOT NULL,
+    seq           INT NOT NULL,
+    nibble_l1     INT NOT NULL,
+    nibble_l2     INT NOT NULL,
+    user_nibble_1 INT NOT NULL,
+    user_nibble_2 INT NOT NULL,
     PRIMARY KEY (onid, tsid, sid, event_id, seq)
-);
+) ENGINE=InnoDB CHARACTER SET utf8mb4
+)sql";
+
+static const char* DDL_AUDIO = R"sql(
 CREATE TABLE IF NOT EXISTS event_audio (
-    onid                INTEGER NOT NULL,
-    tsid                INTEGER NOT NULL,
-    sid                 INTEGER NOT NULL,
-    event_id            INTEGER NOT NULL,
-    component_tag       INTEGER NOT NULL,
-    stream_content      INTEGER NOT NULL DEFAULT 0,
-    component_type      INTEGER NOT NULL DEFAULT 0,
-    stream_type         INTEGER NOT NULL DEFAULT 0,
-    simulcast_group_tag INTEGER NOT NULL DEFAULT 0,
-    multi_lingual       INTEGER NOT NULL DEFAULT 0,
-    main_component      INTEGER NOT NULL DEFAULT 0,
-    quality_indicator   INTEGER NOT NULL DEFAULT 0,
-    sampling_rate       INTEGER NOT NULL DEFAULT 0,
+    onid                INT NOT NULL,
+    tsid                INT NOT NULL,
+    sid                 INT NOT NULL,
+    event_id            INT NOT NULL,
+    component_tag       INT NOT NULL,
+    stream_content      INT NOT NULL DEFAULT 0,
+    component_type      INT NOT NULL DEFAULT 0,
+    stream_type         INT NOT NULL DEFAULT 0,
+    simulcast_group_tag INT NOT NULL DEFAULT 0,
+    multi_lingual       INT NOT NULL DEFAULT 0,
+    main_component      INT NOT NULL DEFAULT 0,
+    quality_indicator   INT NOT NULL DEFAULT 0,
+    sampling_rate       INT NOT NULL DEFAULT 0,
     text_char           TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (onid, tsid, sid, event_id, component_tag)
-);
+) ENGINE=InnoDB CHARACTER SET utf8mb4
+)sql";
+
+static const char* DDL_GROUPS = R"sql(
 CREATE TABLE IF NOT EXISTS event_groups (
-    onid         INTEGER NOT NULL,
-    tsid         INTEGER NOT NULL,
-    sid          INTEGER NOT NULL,
-    event_id     INTEGER NOT NULL,
-    group_type   INTEGER NOT NULL,
-    seq          INTEGER NOT NULL,
-    ref_onid     INTEGER NOT NULL,
-    ref_tsid     INTEGER NOT NULL,
-    ref_sid      INTEGER NOT NULL,
-    ref_event_id INTEGER NOT NULL,
+    onid         INT NOT NULL,
+    tsid         INT NOT NULL,
+    sid          INT NOT NULL,
+    event_id     INT NOT NULL,
+    group_type   INT NOT NULL,
+    seq          INT NOT NULL,
+    ref_onid     INT NOT NULL,
+    ref_tsid     INT NOT NULL,
+    ref_sid      INT NOT NULL,
+    ref_event_id INT NOT NULL,
     PRIMARY KEY (onid, tsid, sid, event_id, group_type, seq)
-);
-CREATE INDEX IF NOT EXISTS idx_events_start   ON events(start_time);
-CREATE INDEX IF NOT EXISTS idx_events_service ON events(onid, tsid, sid);
+) ENGINE=InnoDB CHARACTER SET utf8mb4
 )sql";
-
-const char* DDL_FTS_AND_VIEWS = R"sql(
-CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
-    event_name, short_text, ext_text,
-    content=events, content_rowid=rowid,
-    tokenize='trigram'
-);
-DROP VIEW IF EXISTS upcoming;
-DROP VIEW IF EXISTS program_guide;
-CREATE VIEW program_guide AS
-    SELECT e.rowid, e.*, s.service_name, s.network_name, s.remote_control_key
-    FROM events e JOIN services s USING (onid, tsid, sid);
-CREATE VIEW upcoming AS
-    SELECT * FROM program_guide
-    WHERE start_time > datetime('now', '+9 hours');
-)sql";
-
-struct Stmt {
-    sqlite3_stmt* s = nullptr;
-    ~Stmt() { if (s) sqlite3_finalize(s); }
-    bool prepare(sqlite3* db, const char* sql) {
-        return sqlite3_prepare_v2(db, sql, -1, &s, nullptr) == SQLITE_OK;
-    }
-    void reset() { sqlite3_reset(s); }
-    void bind_int(int col, sqlite3_int64 v) { sqlite3_bind_int64(s, col, v); }
-    void bind_text(int col, const std::string& v) {
-        sqlite3_bind_text(s, col, v.c_str(), -1, SQLITE_TRANSIENT);
-    }
-    void bind_null(int col) { sqlite3_bind_null(s, col); }
-    void step() { sqlite3_step(s); }
-};
-
-void exec_sql(sqlite3* db, const char* sql)
-{
-    char* err = nullptr;
-    sqlite3_exec(db, sql, nullptr, nullptr, &err);
-    if (err) sqlite3_free(err);
-}
 
 } // namespace
 
-void ExportEpgToSqlite(const wchar_t* dbPath, const std::map<LONGLONG, EPGDB_SERVICE_EVENT_INFO>& epgMap)
+void ExportEpgToMysql(const wchar_t* configPath, const std::map<LONGLONG, EPGDB_SERVICE_EVENT_INFO>& epgMap)
 {
-    string dbPathU8;
-    WtoUTF8(wstring(dbPath), dbPathU8);
-
-    sqlite3* db = nullptr;
-    if (sqlite3_open_v2(dbPathU8.c_str(), &db,
-                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
-        AddDebugLogFormat(L"EpgSqliteExporter: DB open failed: %ls", dbPath);
-        if (db) sqlite3_close(db);
+    ConnInfo ci;
+    if (!LoadConnInfo(configPath, ci)) {
+        AddDebugLogFormat(L"EpgMysql: config not found or invalid, skipping: %ls", configPath);
         return;
     }
 
-    exec_sql(db, "PRAGMA journal_mode=WAL;");
-    exec_sql(db, "PRAGMA synchronous=NORMAL;");
-    exec_sql(db, DDL_CREATE_TABLES);
-    exec_sql(db, DDL_FTS_AND_VIEWS);
-    exec_sql(db, "BEGIN;");
+    MYSQL* db = mysql_init(nullptr);
+    if (!mysql_real_connect(db, ci.host.c_str(), ci.user.c_str(), ci.password.c_str(),
+                            ci.database.c_str(), ci.port, nullptr, 0)) {
+        AddDebugLogFormat(L"EpgMysql: connect failed: %S", mysql_error(db));
+        mysql_close(db);
+        return;
+    }
 
-    Stmt svcStmt, evtStmt, gnrStmt, audStmt, grpStmt;
-    svcStmt.prepare(db,
-        "INSERT OR REPLACE INTO services(onid,tsid,sid,service_type,partial_reception,provider_name,"
-        "service_name,network_name,ts_name,remote_control_key,updated_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?)");
-    evtStmt.prepare(db,
-        "INSERT OR REPLACE INTO events(onid,tsid,sid,event_id,start_time,duration_sec,event_name,"
-        "short_text,ext_text,component_stream_content,component_type,component_tag,"
-        "component_text,free_ca_flag,updated_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    gnrStmt.prepare(db,
-        "INSERT OR REPLACE INTO event_genres(onid,tsid,sid,event_id,seq,nibble_l1,nibble_l2,user_nibble_1,user_nibble_2)"
-        " VALUES(?,?,?,?,?,?,?,?,?)");
-    audStmt.prepare(db,
-        "INSERT OR REPLACE INTO event_audio(onid,tsid,sid,event_id,component_tag,stream_content,component_type,"
-        "stream_type,simulcast_group_tag,multi_lingual,main_component,quality_indicator,sampling_rate,text_char)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    grpStmt.prepare(db,
-        "INSERT OR REPLACE INTO event_groups(onid,tsid,sid,event_id,group_type,seq,ref_onid,ref_tsid,ref_sid,ref_event_id)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?)");
+    mysql_set_character_set(db, "utf8mb4");
+
+    Exec(db, DDL_SERVICES);
+    Exec(db, DDL_EVENTS);
+    Exec(db, DDL_GENRES);
+    Exec(db, DDL_AUDIO);
+    Exec(db, DDL_GROUPS);
+
+    Exec(db, "START TRANSACTION");
 
     std::string nowStr;
     {
@@ -194,115 +214,114 @@ void ExportEpgToSqlite(const wchar_t* dbPath, const std::map<LONGLONG, EPGDB_SER
         ++svcCount;
         evtCount += (int)kv.second.eventList.size();
 
-        svcStmt.bind_int (1, svc.ONID);
-        svcStmt.bind_int (2, svc.TSID);
-        svcStmt.bind_int (3, svc.SID);
-        svcStmt.bind_int (4, svc.service_type);
-        svcStmt.bind_int (5, svc.partialReceptionFlag);
-        svcStmt.bind_text(6, W2U8(svc.service_provider_name));
-        svcStmt.bind_text(7, W2U8(svc.service_name));
-        svcStmt.bind_text(8, W2U8(svc.network_name));
-        svcStmt.bind_text(9, W2U8(svc.ts_name));
-        svcStmt.bind_int (10, svc.remote_control_key_id);
-        svcStmt.bind_text(11, nowStr);
-        svcStmt.step();
-        svcStmt.reset();
+        std::string sql =
+            "REPLACE INTO services(onid,tsid,sid,service_type,partial_reception,"
+            "provider_name,service_name,network_name,ts_name,remote_control_key,updated_at) VALUES("
+            + std::to_string(svc.ONID) + ","
+            + std::to_string(svc.TSID) + ","
+            + std::to_string(svc.SID)  + ","
+            + std::to_string(svc.service_type) + ","
+            + std::to_string(svc.partialReceptionFlag) + ","
+            + Q(db, W2U8(svc.service_provider_name)) + ","
+            + Q(db, W2U8(svc.service_name))          + ","
+            + Q(db, W2U8(svc.network_name))           + ","
+            + Q(db, W2U8(svc.ts_name))                + ","
+            + std::to_string(svc.remote_control_key_id) + ","
+            + Q(db, nowStr) + ")";
+        Exec(db, sql);
 
         for (const EPGDB_EVENT_INFO& evt : kv.second.eventList) {
-            evtStmt.bind_int (1, evt.original_network_id);
-            evtStmt.bind_int (2, evt.transport_stream_id);
-            evtStmt.bind_int (3, evt.service_id);
-            evtStmt.bind_int (4, evt.event_id);
-            if (evt.StartTimeFlag)
-                evtStmt.bind_text(5, SystemTimeToStr(evt.start_time));
-            else
-                evtStmt.bind_null(5);
-            if (evt.DurationFlag)
-                evtStmt.bind_int (6, evt.durationSec);
-            else
-                evtStmt.bind_null(6);
-            evtStmt.bind_text(7,  evt.hasShortInfo ? W2U8(evt.shortInfo.event_name) : "");
-            evtStmt.bind_text(8,  evt.hasShortInfo ? W2U8(evt.shortInfo.text_char)  : "");
-            evtStmt.bind_text(9,  evt.hasExtInfo   ? W2U8(evt.extInfo.text_char)    : "");
-            if (evt.hasComponentInfo) {
-                evtStmt.bind_int (10, evt.componentInfo.stream_content);
-                evtStmt.bind_int (11, evt.componentInfo.component_type);
-                evtStmt.bind_int (12, evt.componentInfo.component_tag);
-                evtStmt.bind_text(13, W2U8(evt.componentInfo.text_char));
-            } else {
-                evtStmt.bind_null(10);
-                evtStmt.bind_null(11);
-                evtStmt.bind_null(12);
-                evtStmt.bind_text(13, "");
-            }
-            evtStmt.bind_int (14, evt.freeCAFlag);
-            evtStmt.bind_text(15, nowStr);
-            evtStmt.step();
-            evtStmt.reset();
+            sql =
+                "REPLACE INTO events(onid,tsid,sid,event_id,start_time,duration_sec,"
+                "event_name,short_text,ext_text,"
+                "component_stream_content,component_type,component_tag,component_text,"
+                "free_ca_flag,updated_at) VALUES("
+                + std::to_string(evt.original_network_id)  + ","
+                + std::to_string(evt.transport_stream_id)  + ","
+                + std::to_string(evt.service_id)           + ","
+                + std::to_string(evt.event_id)             + ","
+                + NQ(db, evt.StartTimeFlag != 0, SystemTimeToStr(evt.start_time)) + ","
+                + N(evt.DurationFlag != 0, evt.durationSec) + ","
+                + Q(db, evt.hasShortInfo ? W2U8(evt.shortInfo.event_name) : "") + ","
+                + Q(db, evt.hasShortInfo ? W2U8(evt.shortInfo.text_char)  : "") + ","
+                + Q(db, evt.hasExtInfo   ? W2U8(evt.extInfo.text_char)    : "") + ","
+                + N(evt.hasComponentInfo, evt.componentInfo.stream_content)  + ","
+                + N(evt.hasComponentInfo, evt.componentInfo.component_type)  + ","
+                + N(evt.hasComponentInfo, evt.componentInfo.component_tag)   + ","
+                + Q(db, evt.hasComponentInfo ? W2U8(evt.componentInfo.text_char) : "") + ","
+                + std::to_string(evt.freeCAFlag) + ","
+                + Q(db, nowStr) + ")";
+            Exec(db, sql);
 
             if (evt.hasContentInfo) {
                 int seq = 0;
                 for (const auto& g : evt.contentInfo.nibbleList) {
-                    gnrStmt.bind_int(1, evt.original_network_id);
-                    gnrStmt.bind_int(2, evt.transport_stream_id);
-                    gnrStmt.bind_int(3, evt.service_id);
-                    gnrStmt.bind_int(4, evt.event_id);
-                    gnrStmt.bind_int(5, seq++);
-                    gnrStmt.bind_int(6, g.content_nibble_level_1);
-                    gnrStmt.bind_int(7, g.content_nibble_level_2);
-                    gnrStmt.bind_int(8, g.user_nibble_1);
-                    gnrStmt.bind_int(9, g.user_nibble_2);
-                    gnrStmt.step();
-                    gnrStmt.reset();
+                    sql =
+                        "REPLACE INTO event_genres(onid,tsid,sid,event_id,seq,"
+                        "nibble_l1,nibble_l2,user_nibble_1,user_nibble_2) VALUES("
+                        + std::to_string(evt.original_network_id) + ","
+                        + std::to_string(evt.transport_stream_id) + ","
+                        + std::to_string(evt.service_id)          + ","
+                        + std::to_string(evt.event_id)            + ","
+                        + std::to_string(seq++)                   + ","
+                        + std::to_string(g.content_nibble_level_1) + ","
+                        + std::to_string(g.content_nibble_level_2) + ","
+                        + std::to_string(g.user_nibble_1)           + ","
+                        + std::to_string(g.user_nibble_2)           + ")";
+                    Exec(db, sql);
                 }
             }
 
             if (evt.hasAudioInfo) {
                 for (const auto& a : evt.audioInfo.componentList) {
-                    audStmt.bind_int (1, evt.original_network_id);
-                    audStmt.bind_int (2, evt.transport_stream_id);
-                    audStmt.bind_int (3, evt.service_id);
-                    audStmt.bind_int (4, evt.event_id);
-                    audStmt.bind_int (5, a.component_tag);
-                    audStmt.bind_int (6, a.stream_content);
-                    audStmt.bind_int (7, a.component_type);
-                    audStmt.bind_int (8, a.stream_type);
-                    audStmt.bind_int (9, a.simulcast_group_tag);
-                    audStmt.bind_int (10, a.ES_multi_lingual_flag);
-                    audStmt.bind_int (11, a.main_component_flag);
-                    audStmt.bind_int (12, a.quality_indicator);
-                    audStmt.bind_int (13, a.sampling_rate);
-                    audStmt.bind_text(14, W2U8(a.text_char));
-                    audStmt.step();
-                    audStmt.reset();
+                    sql =
+                        "REPLACE INTO event_audio(onid,tsid,sid,event_id,component_tag,"
+                        "stream_content,component_type,stream_type,simulcast_group_tag,"
+                        "multi_lingual,main_component,quality_indicator,sampling_rate,text_char) VALUES("
+                        + std::to_string(evt.original_network_id) + ","
+                        + std::to_string(evt.transport_stream_id) + ","
+                        + std::to_string(evt.service_id)          + ","
+                        + std::to_string(evt.event_id)            + ","
+                        + std::to_string(a.component_tag)         + ","
+                        + std::to_string(a.stream_content)        + ","
+                        + std::to_string(a.component_type)        + ","
+                        + std::to_string(a.stream_type)           + ","
+                        + std::to_string(a.simulcast_group_tag)   + ","
+                        + std::to_string(a.ES_multi_lingual_flag) + ","
+                        + std::to_string(a.main_component_flag)   + ","
+                        + std::to_string(a.quality_indicator)     + ","
+                        + std::to_string(a.sampling_rate)         + ","
+                        + Q(db, W2U8(a.text_char)) + ")";
+                    Exec(db, sql);
                 }
             }
 
-            auto writeGroup = [&](const EPGDB_EVENTGROUP_INFO& info, int groupType) {
+            auto writeGroups = [&](const EPGDB_EVENTGROUP_INFO& info, int groupType) {
                 int seq = 0;
                 for (const auto& r : info.eventDataList) {
-                    grpStmt.bind_int(1, evt.original_network_id);
-                    grpStmt.bind_int(2, evt.transport_stream_id);
-                    grpStmt.bind_int(3, evt.service_id);
-                    grpStmt.bind_int(4, evt.event_id);
-                    grpStmt.bind_int(5, groupType);
-                    grpStmt.bind_int(6, seq++);
-                    grpStmt.bind_int(7, r.original_network_id);
-                    grpStmt.bind_int(8, r.transport_stream_id);
-                    grpStmt.bind_int(9, r.service_id);
-                    grpStmt.bind_int(10, r.event_id);
-                    grpStmt.step();
-                    grpStmt.reset();
+                    std::string gsql =
+                        "REPLACE INTO event_groups(onid,tsid,sid,event_id,group_type,seq,"
+                        "ref_onid,ref_tsid,ref_sid,ref_event_id) VALUES("
+                        + std::to_string(evt.original_network_id) + ","
+                        + std::to_string(evt.transport_stream_id) + ","
+                        + std::to_string(evt.service_id)          + ","
+                        + std::to_string(evt.event_id)            + ","
+                        + std::to_string(groupType)               + ","
+                        + std::to_string(seq++)                   + ","
+                        + std::to_string(r.original_network_id)   + ","
+                        + std::to_string(r.transport_stream_id)   + ","
+                        + std::to_string(r.service_id)            + ","
+                        + std::to_string(r.event_id)              + ")";
+                    Exec(db, gsql);
                 }
             };
-            writeGroup(evt.eventGroupInfo, 1);
-            writeGroup(evt.eventRelayInfo,  2);
+            writeGroups(evt.eventGroupInfo, 1);
+            writeGroups(evt.eventRelayInfo,  2);
         }
     }
 
-    exec_sql(db, "INSERT INTO events_fts(events_fts) VALUES('rebuild');");
-    exec_sql(db, "COMMIT;");
-    sqlite3_close(db);
+    Exec(db, "COMMIT");
+    mysql_close(db);
 
-    AddDebugLogFormat(L"EpgSqliteExporter: done svc=%d evt=%d path=%ls", svcCount, evtCount, dbPath);
+    AddDebugLogFormat(L"EpgMysql: done svc=%d evt=%d", svcCount, evtCount);
 }

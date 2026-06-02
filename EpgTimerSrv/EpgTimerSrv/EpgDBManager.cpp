@@ -342,10 +342,10 @@ void CEpgDBManager::LoadThread(CEpgDBManager* sys)
 		AddDebugLogFormat(L"EpgData: parsed svc=%d evt=%d", (int)nextMap.size(), totalEvt);
 	}
 
-	// EPGデータをSQLiteに書き出す
+	// EPGデータをMySQLに書き出す
 	if( sys->loadStop == false ){
-		fs_path dbPath = fs_path(settingPath).append(L"EpgData.db");
-		ExportEpgToSqlite(dbPath.c_str(), nextMap);
+		fs_path configPath = fs_path(settingPath).append(L"EpgMysqlConn.ini");
+		ExportEpgToMysql(configPath.c_str(), nextMap);
 	}
 
 	__int64 arcMax = GetNowI64Time() / I64_1SEC * I64_1SEC;
