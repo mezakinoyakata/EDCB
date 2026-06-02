@@ -15,11 +15,15 @@
 #include <regex>
 #endif
 
+class CReserveManager;
+
 class CEpgDBManager
 {
 public:
 	CEpgDBManager();
 	~CEpgDBManager();
+
+	CReserveManager* pReserveManager = nullptr;
 
 	void SetArchivePeriod(int periodSec);
 

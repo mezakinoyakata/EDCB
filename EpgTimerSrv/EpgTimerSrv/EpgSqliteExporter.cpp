@@ -1,6 +1,7 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "EpgSqliteExporter.h"
 #include "../../Common/StringUtil.h"
+#include "../../Common/TimeUtil.h"
 #include <mysql.h>
 #include <fstream>
 
@@ -21,6 +22,18 @@ std::string SystemTimeToStr(const SYSTEMTIME& st)
     return buf;
 }
 
+// YYYYWW 形式の year_week を計算（例: 202622）
+int CalcYearWeek(const SYSTEMTIME& st)
+{
+    static const int dim[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int doy = st.wDay;
+    for (int m = 1; m < st.wMonth; m++) {
+        doy += dim[m];
+        if (m == 2 && st.wYear % 4 == 0 && (st.wYear % 100 != 0 || st.wYear % 400 == 0)) doy++;
+    }
+    return st.wYear * 100 + (doy - 1) / 7 + 1;
+}
+
 // MySQL 接続設定（EpgMysqlConn.ini から読み込む）
 struct ConnInfo {
     std::string host     = "localhost";
@@ -32,13 +45,21 @@ struct ConnInfo {
 
 bool LoadConnInfo(const wchar_t* iniPath, ConnInfo& out)
 {
-    std::string pathU8;
-    WtoUTF8(wstring(iniPath), pathU8);
-    std::ifstream f(pathU8);
+    std::ifstream f(iniPath);
     if (!f) return false;
 
+    bool firstLine = true;
     std::string line;
     while (std::getline(f, line)) {
+        if (firstLine) {
+            firstLine = false;
+            if (line.size() >= 3 &&
+                (unsigned char)line[0] == 0xEF &&
+                (unsigned char)line[1] == 0xBB &&
+                (unsigned char)line[2] == 0xBF)
+                line.erase(0, 3);
+        }
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq);
@@ -88,10 +109,10 @@ CREATE TABLE IF NOT EXISTS services (
     sid                INT NOT NULL,
     service_type       INT NOT NULL DEFAULT 0,
     partial_reception  INT NOT NULL DEFAULT 0,
-    provider_name      TEXT NOT NULL DEFAULT '',
-    service_name       TEXT NOT NULL DEFAULT '',
-    network_name       TEXT NOT NULL DEFAULT '',
-    ts_name            TEXT NOT NULL DEFAULT '',
+    provider_name      TEXT NOT NULL,
+    service_name       TEXT NOT NULL,
+    network_name       TEXT NOT NULL,
+    ts_name            TEXT NOT NULL,
     remote_control_key INT NOT NULL DEFAULT 0,
     updated_at         VARCHAR(30) NOT NULL DEFAULT '',
     PRIMARY KEY (onid, tsid, sid)
@@ -106,18 +127,21 @@ CREATE TABLE IF NOT EXISTS events (
     event_id                 INT NOT NULL,
     start_time               VARCHAR(30),
     duration_sec             INT,
-    event_name               TEXT NOT NULL DEFAULT '',
-    short_text               TEXT NOT NULL DEFAULT '',
-    ext_text                 MEDIUMTEXT NOT NULL DEFAULT '',
+    event_name               TEXT NOT NULL,
+    short_text               TEXT NOT NULL,
+    ext_text                 MEDIUMTEXT NOT NULL,
     component_stream_content INT,
     component_type           INT,
     component_tag            INT,
-    component_text           TEXT NOT NULL DEFAULT '',
+    component_text           TEXT NOT NULL,
     free_ca_flag             INT NOT NULL DEFAULT 0,
     updated_at               VARCHAR(30) NOT NULL DEFAULT '',
+    year_week                INT NOT NULL DEFAULT 0,
+    reserve_status           TINYINT NOT NULL DEFAULT 0,
     PRIMARY KEY (onid, tsid, sid, event_id),
     KEY idx_start   (start_time),
-    KEY idx_service (onid, tsid, sid)
+    KEY idx_service (onid, tsid, sid),
+    KEY idx_status  (year_week, reserve_status)
 ) ENGINE=InnoDB CHARACTER SET utf8mb4
 )sql";
 
@@ -151,7 +175,7 @@ CREATE TABLE IF NOT EXISTS event_audio (
     main_component      INT NOT NULL DEFAULT 0,
     quality_indicator   INT NOT NULL DEFAULT 0,
     sampling_rate       INT NOT NULL DEFAULT 0,
-    text_char           TEXT NOT NULL DEFAULT '',
+    text_char           TEXT NOT NULL,
     PRIMARY KEY (onid, tsid, sid, event_id, component_tag)
 ) ENGINE=InnoDB CHARACTER SET utf8mb4
 )sql";
@@ -174,7 +198,9 @@ CREATE TABLE IF NOT EXISTS event_groups (
 
 } // namespace
 
-void ExportEpgToMysql(const wchar_t* configPath, const std::map<LONGLONG, EPGDB_SERVICE_EVENT_INFO>& epgMap)
+void ExportEpgToMysql(const wchar_t* configPath,
+                      const std::map<LONGLONG, EPGDB_SERVICE_EVENT_INFO>& epgMap,
+                      const std::unordered_map<LONGLONG, int>& reserveStatusMap)
 {
     ConnInfo ci;
     if (!LoadConnInfo(configPath, ci)) {
@@ -231,11 +257,25 @@ void ExportEpgToMysql(const wchar_t* configPath, const std::map<LONGLONG, EPGDB_
         Exec(db, sql);
 
         for (const EPGDB_EVENT_INFO& evt : kv.second.eventList) {
+            int yw = (evt.StartTimeFlag != 0) ? CalcYearWeek(evt.start_time) : 0;
+            // reserve_status: 0=未来・未予約 / 1=未来・予約あり / 2=録画終了 / 3=未録画で終了
+            LONGLONG evtKey = ((LONGLONG)evt.original_network_id << 48) |
+                              ((LONGLONG)evt.transport_stream_id << 32) |
+                              ((LONGLONG)evt.service_id          << 16) |
+                              evt.event_id;
+            int rstat = 0;
+            auto it = reserveStatusMap.find(evtKey);
+            if (it != reserveStatusMap.end()) {
+                rstat = it->second; // 1=予約あり or 2=録画終了
+            } else if (evt.StartTimeFlag != 0 && evt.DurationFlag != 0) {
+                __int64 evtEnd = ConvertI64Time(evt.start_time) + (__int64)evt.durationSec * I64_1SEC;
+                if (evtEnd < GetNowI64Time()) rstat = 3; // 未録画で終了
+            }
             sql =
                 "REPLACE INTO events(onid,tsid,sid,event_id,start_time,duration_sec,"
                 "event_name,short_text,ext_text,"
                 "component_stream_content,component_type,component_tag,component_text,"
-                "free_ca_flag,updated_at) VALUES("
+                "free_ca_flag,updated_at,year_week,reserve_status) VALUES("
                 + std::to_string(evt.original_network_id)  + ","
                 + std::to_string(evt.transport_stream_id)  + ","
                 + std::to_string(evt.service_id)           + ","
@@ -250,7 +290,9 @@ void ExportEpgToMysql(const wchar_t* configPath, const std::map<LONGLONG, EPGDB_
                 + N(evt.hasComponentInfo, evt.componentInfo.component_tag)   + ","
                 + Q(db, evt.hasComponentInfo ? W2U8(evt.componentInfo.text_char) : "") + ","
                 + std::to_string(evt.freeCAFlag) + ","
-                + Q(db, nowStr) + ")";
+                + Q(db, nowStr) + ","
+                + std::to_string(yw) + ","
+                + std::to_string(rstat) + ")";
             Exec(db, sql);
 
             if (evt.hasContentInfo) {
@@ -318,6 +360,23 @@ void ExportEpgToMysql(const wchar_t* configPath, const std::map<LONGLONG, EPGDB_
             writeGroups(evt.eventGroupInfo, 1);
             writeGroups(evt.eventRelayInfo,  2);
         }
+    }
+
+    // nextMap 外の録画済みイベントを status=2 に更新
+    for (const auto& kv : reserveStatusMap) {
+        if (kv.second != 2) continue;
+        int onid     = (int)((kv.first >> 48) & 0xFFFF);
+        int tsid     = (int)((kv.first >> 32) & 0xFFFF);
+        int sid      = (int)((kv.first >> 16) & 0xFFFF);
+        int event_id = (int)(kv.first & 0xFFFF);
+        std::string usql =
+            "UPDATE events SET reserve_status=2"
+            " WHERE onid=" + std::to_string(onid) +
+            " AND tsid="   + std::to_string(tsid) +
+            " AND sid="    + std::to_string(sid) +
+            " AND event_id=" + std::to_string(event_id) +
+            " AND reserve_status<>2";
+        Exec(db, usql);
     }
 
     Exec(db, "COMMIT");

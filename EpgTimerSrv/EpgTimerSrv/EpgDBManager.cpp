@@ -1,5 +1,6 @@
 ﻿#include "stdafx.h"
 #include "EpgDBManager.h"
+#include "ReserveManager.h"
 
 #include "../../Common/CommonDef.h"
 #include "../../Common/TimeUtil.h"
@@ -345,7 +346,28 @@ void CEpgDBManager::LoadThread(CEpgDBManager* sys)
 	// EPGデータをMySQLに書き出す
 	if( sys->loadStop == false ){
 		fs_path configPath = fs_path(settingPath).append(L"EpgMysqlConn.ini");
-		ExportEpgToMysql(configPath.c_str(), nextMap);
+		std::unordered_map<LONGLONG, int> reserveStatusMap;
+		if( sys->pReserveManager ){
+			// 録画済み (reserve_status=2)
+			for( const auto& info : sys->pReserveManager->GetRecFileInfoAll(false) ){
+				LONGLONG key = ((LONGLONG)info.originalNetworkID << 48) |
+				               ((LONGLONG)info.transportStreamID << 32) |
+				               ((LONGLONG)info.serviceID << 16) |
+				               info.eventID;
+				reserveStatusMap[key] = 2;
+			}
+			// 予約あり (reserve_status=1) ただし録画済みは上書きしない
+			for( const auto& r : sys->pReserveManager->GetReserveDataAll(false) ){
+				LONGLONG key = ((LONGLONG)r.originalNetworkID << 48) |
+				               ((LONGLONG)r.transportStreamID << 32) |
+				               ((LONGLONG)r.serviceID << 16) |
+				               r.eventID;
+				if( reserveStatusMap.find(key) == reserveStatusMap.end() ){
+					reserveStatusMap[key] = 1;
+				}
+			}
+		}
+		ExportEpgToMysql(configPath.c_str(), nextMap, reserveStatusMap);
 	}
 
 	__int64 arcMax = GetNowI64Time() / I64_1SEC * I64_1SEC;
