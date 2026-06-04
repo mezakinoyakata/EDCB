@@ -23,3 +23,17 @@ Configuration files are stored in the 'ini' directory.
 
 [branch:edcb-plug-in](https://github.com/xtne6f/EDCB/tree/edcb-plug-in)
 * EdcbPlugIn(TVTestプラグイン)のブランチ。説明は[releases](https://github.com/xtne6f/EDCB/releases)に添付
+
+---
+
+## mezakinoyakata/EDCB fork について
+
+[xtne6f/EDCB](https://github.com/xtne6f/EDCB) の `work-plus-s` をベースに、EPGデータをMySQLへ書き出す機能を追加しています（[`for-deploy` ブランチ](https://github.com/mezakinoyakata/EDCB/tree/for-deploy)）。
+
+### 追加機能
+
+- `EpgSqliteExporter`: EpgTimerSrv がEPGデータをロードするたびにMySQLへUPSERTで蓄積書き出し
+  - 接続設定: `{SettingPath}\EpgMysqlConn.ini`
+  - 実行時依存: `libmysql.dll`（MySQL Connector/C）を EpgTimerSrv.exe と同じフォルダに配置
+- [EDCBViewer](https://github.com/mezakinoyakata/EDCBViewer) と連携して録画済み一覧・番組情報の参照に使用
+- 仕様書: `EpgSqliteExporter_Spec.md`
